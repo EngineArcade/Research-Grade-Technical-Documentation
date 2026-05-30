@@ -1,0 +1,509 @@
+"""
+qaoa_circuit.py
+===============
+QAOA / VQC circuit templates for optimising BdG pairing textures on a
+6-site Kagome unit cell.
+
+Backends
+--------
+  ClassicalBackend   — pure numpy statevector (always available, no install)
+  QiskitBackend      — Qiskit Aer statevector or shot-based
+  PennyLaneBackend   — PennyLane default.qubit
+
+PSO particle encoding
+---------------------
+    x = [g0, θ0, g1, θ1, ..., g_{G-1}, θ_{G-1}]
+    g ∈ {0=RX, 1=RY, 2=RZ, 3=CX, 4=CZ}   (discrete, rounded)
+    θ ∈ [0, 2π]                             (continuous)
+
+QAOA layer structure (one layer = cost + mixer)
+-----------------------------------------------
+    |+>^n  →  [Cost: RZ(2γ·J_ij) + CZ on bonds]
+           →  [Mixer: chosen gate(g_i, θ_i) on each qubit]
+           →  measure
+
+Pipeline position
+-----------------
+    BdG spectrum  →  PSO  ⇄  [YOU ARE HERE: QAOA VQC]  →  Validation
+
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
+
+from .pso_engine import (
+    decode_particle, encode_particle, particle_bounds,
+    PSOEngine, PSOConfig, GATE_TYPES,
+)
+
+
+# ---------------------------------------------------------------------------
+# Kagome 6-site cost Hamiltonian
+# ---------------------------------------------------------------------------
+
+def kagome_6site_cost_matrix(delta: float = 0.3,
+                              t:     float = -1.0,
+                              mu:    float = -1.0) -> np.ndarray:
+    """
+    6×6 ZZ-coupling matrix J derived from BdG pairing texture.
+
+    H_cost = Σ_{<i,j>} J_ij Z_i Z_j  +  Σ_i J_ii Z_i
+
+    Kagome nearest-neighbour bonds:
+        Triangle A : (0,1), (1,2), (0,2)
+        Triangle B : (3,4), (4,5), (3,5)
+        Inter-tri  : (0,3), (1,4), (2,5)
+
+    Parameters
+    ----------
+    delta : float   BdG pairing amplitude (from BdGSolver.gap() or Delta).
+    t     : float   Hopping parameter (scales J_ij).
+    mu    : float   Chemical potential (on-site term J_ii = mu/2).
+
+    Returns
+    -------
+    J : ndarray (6, 6), real symmetric
+    """
+    J     = np.zeros((6, 6))
+    bonds = [(0,1),(1,2),(0,2),(3,4),(4,5),(3,5),(0,3),(1,4),(2,5)]
+    for i, j in bonds:
+        J[i, j] = J[j, i] = delta * t
+    for i in range(6):
+        J[i, i] = mu / 2.0
+    return J
+
+
+def cost_hamiltonian_matrix(J: np.ndarray) -> np.ndarray:
+    """
+    Build the diagonal of the 2^n cost Hamiltonian in the Z basis.
+
+    H_cost |z> = E(z)|z>,  E(z) = Σ J_ii·z_i  +  Σ_{i<j} J_ij·z_i·z_j
+    where z_i = 1 - 2·bit_i  ∈ {+1, -1}.
+
+    Parameters
+    ----------
+    J : ndarray (n, n)  Symmetric coupling matrix.
+
+    Returns
+    -------
+    H_diag : ndarray (2^n,), real — diagonal of H_cost.
+    """
+    n     = J.shape[0]
+    H     = np.zeros(2 ** n, dtype=float)
+    for state in range(2 ** n):
+        z = [1 - 2 * ((state >> i) & 1) for i in range(n)]
+        e = sum(J[i, i] * z[i] for i in range(n))
+        e += sum(J[i, j] * z[i] * z[j]
+                 for i in range(n) for j in range(i + 1, n))
+        H[state] = e
+    return H
+
+
+# ---------------------------------------------------------------------------
+# Abstract backend
+# ---------------------------------------------------------------------------
+
+class CircuitBackend:
+    """Abstract base for quantum circuit backends."""
+
+    def expectation(self, params, gate_types, thetas, H_cost_diag) -> float:
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Classical (numpy) backend — no extra install required
+# ---------------------------------------------------------------------------
+
+class ClassicalBackend(CircuitBackend):
+    """
+    Pure-numpy statevector simulator.
+
+    Applies single-qubit gates (RX/RY/RZ) and CNOT/CZ directly to |+>^n.
+    Suitable for n_qubits ≤ 16.
+
+    Parameters
+    ----------
+    n_qubits : int
+    """
+
+    def __init__(self, n_qubits: int = 6):
+        self.n_qubits = n_qubits
+
+    def _apply_gate(self, sv: np.ndarray, gate: int,
+                    theta: float, target: int) -> np.ndarray:
+        n   = self.n_qubits
+        c   = np.cos(theta / 2.0)
+        s   = np.sin(theta / 2.0)
+        if gate == 0:    # RX
+            U = np.array([[c,        -1j * s],
+                          [-1j * s,   c     ]], dtype=complex)
+        elif gate == 1:  # RY
+            U = np.array([[c, -s],
+                          [s,  c]], dtype=complex)
+        elif gate == 2:  # RZ
+            U = np.array([[np.exp(-1j * theta / 2), 0],
+                          [0, np.exp( 1j * theta / 2)]], dtype=complex)
+        else:            # CX / CZ — treat as CNOT(target, (target+1)%n)
+            return self._apply_cx(sv, target, (target + 1) % n)
+
+        sv_r = sv.reshape([2] * n)
+        sv_r = np.moveaxis(np.tensordot(U, sv_r, axes=([1], [target])), 0, target)
+        return sv_r.reshape(2 ** n)
+
+    def _apply_cx(self, sv: np.ndarray, ctrl: int, tgt: int) -> np.ndarray:
+        sv2 = sv.copy()
+        for state in range(len(sv)):
+            if (state >> ctrl) & 1:
+                flipped          = state ^ (1 << tgt)
+                sv2[state]       = sv[flipped]
+                sv2[flipped]     = sv[state]
+        return sv2
+
+    def expectation(self,
+                    params,
+                    gate_types: List[int],
+                    thetas:     List[float],
+                    H_cost_diag: np.ndarray) -> float:
+        """Evaluate <psi(params)|H_cost|psi(params)> via exact statevector."""
+        n    = self.n_qubits
+        dim  = 2 ** n
+        sv   = np.ones(dim, dtype=complex) / np.sqrt(dim)   # |+>^n
+        for idx, (gt, th) in enumerate(zip(gate_types, thetas)):
+            sv = self._apply_gate(sv, gt, th, idx % n)
+        probs = np.abs(sv) ** 2
+        return float(np.dot(probs, H_cost_diag[:dim]))
+
+
+# ---------------------------------------------------------------------------
+# Qiskit backend
+# ---------------------------------------------------------------------------
+
+class QiskitBackend(CircuitBackend):
+    """
+    Evaluate QAOA circuits using Qiskit Aer.
+
+    Requires: pip install qiskit qiskit-aer
+
+    Parameters
+    ----------
+    n_qubits    : int
+    shots       : int or None   None → exact statevector; int → shot-based.
+    noise_model : qiskit_aer.noise.NoiseModel or None
+    """
+
+    def __init__(self, n_qubits: int = 12,
+                 shots=None, noise_model=None):
+        self.n_qubits    = n_qubits
+        self.shots       = shots
+        self.noise_model = noise_model
+        try:
+            import qiskit       # noqa: F401
+            import qiskit_aer   # noqa: F401
+            self._ok = True
+        except ImportError:
+            warnings.warn("Qiskit / qiskit-aer not installed. "
+                          "Install with: pip install qiskit qiskit-aer")
+            self._ok = False
+
+    def build_circuit(self, gate_types, thetas, p_layers=1):
+        """Build QAOA QuantumCircuit from decoded PSO params."""
+        if not self._ok:
+            raise ImportError("Qiskit not available.")
+        from qiskit import QuantumCircuit
+        from qiskit.circuit.library import RXGate, RYGate, RZGate
+        n  = self.n_qubits
+        qc = QuantumCircuit(n)
+        qc.h(range(n))   # initial superposition
+
+        n_per = max(1, len(gate_types) // max(p_layers, 1))
+        for layer in range(p_layers):
+            base  = layer * n_per
+            gamma = thetas[base % len(thetas)]
+            for q in range(n):
+                qc.rz(2 * gamma, q)
+            for qi in range(0, n - 1, 2):
+                ang = thetas[(base + qi) % len(thetas)]
+                qc.cx(qi, qi + 1); qc.rz(2 * ang, qi + 1); qc.cx(qi, qi + 1)
+            gt  = gate_types[(base + 1) % len(gate_types)]
+            ang = thetas[(base + 1)  % len(thetas)]
+            GM  = {0: RXGate, 1: RYGate, 2: RZGate}.get(gt, RXGate)
+            for q in range(n):
+                qc.append(GM(ang), [q])
+            if gt == 3:
+                for qi in range(0, n - 1, 2): qc.cx(qi, qi + 1)
+            elif gt == 4:
+                for qi in range(0, n - 1, 2): qc.cz(qi, qi + 1)
+        return qc
+
+    def expectation(self, params, gate_types, thetas, H_cost_diag) -> float:
+        if not self._ok:
+            raise ImportError("Qiskit not available.")
+        from qiskit_aer import AerSimulator
+        from qiskit import transpile
+        qc  = self.build_circuit(gate_types, thetas)
+        if self.shots is None:
+            qc.save_statevector()
+            be   = AerSimulator(method="statevector")
+            sv   = be.run(transpile(qc, be)).result().get_statevector(qc)
+            probs = np.abs(np.asarray(sv)) ** 2
+            return float(np.dot(probs, H_cost_diag[:len(probs)]))
+        else:
+            qc.measure_all()
+            be     = AerSimulator()
+            counts = be.run(transpile(qc, be), shots=self.shots,
+                            noise_model=self.noise_model).result().get_counts()
+            energy = 0.0
+            for bitstr, count in counts.items():
+                state   = int(bitstr[::-1], 2)
+                energy += H_cost_diag[state] * count / self.shots
+            return energy
+
+
+# ---------------------------------------------------------------------------
+# PennyLane backend
+# ---------------------------------------------------------------------------
+
+class PennyLaneBackend(CircuitBackend):
+    """
+    Evaluate QAOA circuits using PennyLane default.qubit.
+
+    Requires: pip install pennylane
+
+    Parameters
+    ----------
+    n_qubits : int
+    shots    : int or None   None → analytic; int → shot-based.
+    """
+
+    def __init__(self, n_qubits: int = 12, shots=None):
+        self.n_qubits = n_qubits
+        self.shots    = shots
+        try:
+            import pennylane  # noqa: F401
+            self._ok = True
+        except ImportError:
+            warnings.warn("PennyLane not installed. "
+                          "Install with: pip install pennylane")
+            self._ok = False
+
+    def expectation(self, params, gate_types, thetas, H_cost_diag) -> float:
+        if not self._ok:
+            raise ImportError("PennyLane not available.")
+        import pennylane as qml
+        n   = self.n_qubits
+        dev = qml.device("default.qubit", wires=n,
+                         **({} if self.shots is None else {"shots": self.shots}))
+
+        # Build Hamiltonian as sum of single-qubit Z terms (approximation)
+        coeffs = []
+        obs    = []
+        for i in range(n):
+            h_i = sum(H_cost_diag[s] * (1 - 2 * ((s >> i) & 1))
+                      for s in range(2 ** n)) / (2 ** (n - 1))
+            coeffs.append(float(h_i))
+            obs.append(qml.PauliZ(i))
+        H_pl = qml.Hamiltonian(coeffs, obs)
+
+        @qml.qnode(dev)
+        def circuit():
+            for q in range(n):
+                qml.Hadamard(wires=q)
+            for idx, (gt, ang) in enumerate(zip(gate_types, thetas)):
+                if   gt == 0:
+                    for q in range(n): qml.RX(ang, wires=q)
+                elif gt == 1:
+                    for q in range(n): qml.RY(ang, wires=q)
+                elif gt == 2:
+                    for q in range(n): qml.RZ(ang, wires=q)
+                elif gt == 3:
+                    for q in range(0, n-1, 2): qml.CNOT(wires=[q, q+1])
+                elif gt == 4:
+                    for q in range(0, n-1, 2): qml.CZ(wires=[q, q+1])
+            return qml.expval(H_pl)
+
+        return float(circuit())
+
+
+# ---------------------------------------------------------------------------
+# Main circuit wrapper
+# ---------------------------------------------------------------------------
+
+class KagomePairingCircuit:
+    """
+    QAOA VQC for BdG pairing texture optimisation on a 6-site Kagome cell.
+
+    Wires together:
+      • 6-site Kagome cost Hamiltonian (from BdG J matrix)
+      • Chosen backend (classical / qiskit / pennylane)
+      • PSO fitness hook
+
+    Parameters
+    ----------
+    n_sites           : int    Kagome sites. Default 6.
+    p_layers          : int    QAOA depth p. Default 2.
+    n_qubits_per_site : int    Qubits per site (1 spin-polarised, 2 spin-½). Default 2.
+    backend           : str    'classical' | 'qiskit' | 'pennylane'.
+    delta_seed        : float  BdG pairing amplitude → initialise J.
+    t                 : float  Hopping.
+    mu                : float  Chemical potential.
+    shots             : int or None
+
+    Key attributes
+    --------------
+    param_dim : int   = 2 * n_gates  (PSO particle length)
+    n_gates   : int   total gate slots encoded
+    """
+
+    def __init__(self,
+                 n_sites:           int   = 6,
+                 p_layers:          int   = 2,
+                 n_qubits_per_site: int   = 2,
+                 backend:           str   = "classical",
+                 delta_seed:        float = 0.3,
+                 t:                 float = -1.0,
+                 mu:                float = -1.0,
+                 shots:             Optional[int] = None):
+        self.n_sites   = n_sites
+        self.p_layers  = p_layers
+        self.n_qubits  = n_sites * n_qubits_per_site
+        self.J         = kagome_6site_cost_matrix(delta_seed, t, mu)
+
+        # Cost Hamiltonian uses min(n_sites, 6) logical qubits
+        n_cost              = min(n_sites, 6)
+        self._H_cost_diag   = cost_hamiltonian_matrix(self.J[:n_cost, :n_cost])
+        self._n_cq          = int(np.log2(len(self._H_cost_diag)))   # cost qubits
+
+        # Gates per layer: 2 * n_cost  (one cost pass + one mixer pass)
+        self.n_gates   = p_layers * (2 * self._n_cq)
+        self.param_dim = 2 * self.n_gates
+
+        self.backend_name = backend
+        self._backend     = self._init_backend(backend, shots)
+
+    def _init_backend(self, name: str, shots) -> CircuitBackend:
+        if name == "classical":
+            return ClassicalBackend(self._n_cq)
+        elif name == "qiskit":
+            return QiskitBackend(self.n_qubits, shots=shots)
+        elif name == "pennylane":
+            return PennyLaneBackend(self.n_qubits, shots=shots)
+        else:
+            raise ValueError(f"Unknown backend '{name}'. "
+                             "Choose 'classical', 'qiskit', or 'pennylane'.")
+
+    def fitness(self, x: np.ndarray) -> float:
+        """
+        PSO fitness hook.
+
+        Parameters
+        ----------
+        x : ndarray (param_dim,)   PSO particle [g0,θ0,g1,θ1,...].
+
+        Returns
+        -------
+        cost : float   <H_cost> (lower is better).
+        """
+        gate_types, thetas = decode_particle(x)
+        return self._backend.expectation(x, gate_types, thetas,
+                                         self._H_cost_diag)
+
+    def bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (lb, ub) arrays suitable for PSOEngine."""
+        return particle_bounds(self.n_gates)
+
+    def describe(self) -> str:
+        lines = [
+            "KagomePairingCircuit",
+            f"  Sites         : {self.n_sites}",
+            f"  Qubits total  : {self.n_qubits}",
+            f"  Cost qubits   : {self._n_cq}  (H_cost dim = 2^{self._n_cq})",
+            f"  QAOA depth    : p = {self.p_layers}",
+            f"  Gate slots    : {self.n_gates}",
+            f"  Param dim     : {self.param_dim}",
+            f"  Backend       : {self.backend_name}",
+            f"  Delta seed    : {self.J[0,1]:.4f}  (J_01)",
+        ]
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# One-call convenience function
+# ---------------------------------------------------------------------------
+
+def run_pso_qaoa(n_sites:     int   = 6,
+                 p_layers:    int   = 2,
+                 backend:     str   = "classical",
+                 delta_seed:  float = 0.3,
+                 n_particles: int   = 30,
+                 n_iter:      int   = 100,
+                 seed:        int   = 42,
+                 verbose:     bool  = True) -> dict:
+    """
+    Run the complete PSO-seeded QAOA optimisation on a Kagome cell.
+
+    Parameters
+    ----------
+    n_sites     : int    Kagome sites.
+    p_layers    : int    QAOA circuit depth.
+    backend     : str    'classical' | 'qiskit' | 'pennylane'.
+    delta_seed  : float  BdG pairing amplitude seed.
+    n_particles : int    PSO swarm size.
+    n_iter      : int    PSO iterations.
+    seed        : int    RNG seed.
+    verbose     : bool
+
+    Returns
+    -------
+    result : dict
+        'g_best'         ndarray — best parameter vector
+        'g_best_cost'    float   — minimum QAOA energy achieved
+        'history'        list    — cost per iteration
+        'converged'      bool
+        'circuit'        KagomePairingCircuit instance
+        'decoded_params' tuple   (gate_types, thetas)
+
+    Example
+    -------
+        from pso_qaoa import run_pso_qaoa
+        result = run_pso_qaoa(n_sites=6, p_layers=2, backend='classical',
+                               n_particles=30, n_iter=100)
+        print('Best energy:', result['g_best_cost'])
+    """
+    circuit = KagomePairingCircuit(n_sites=n_sites, p_layers=p_layers,
+                                   backend=backend, delta_seed=delta_seed)
+    if verbose:
+        print(circuit.describe())
+        print()
+
+    lb, ub  = circuit.bounds()
+    config  = PSOConfig(n_particles=n_particles, n_iter=n_iter,
+                        seed=seed, verbose=verbose)
+    pso     = PSOEngine(circuit.fitness, config, dim=circuit.param_dim,
+                        lb=lb, ub=ub)
+    result  = pso.run()
+    result["circuit"]        = circuit
+    result["decoded_params"] = decode_particle(result["g_best"])
+    result["pso_engine"]     = pso
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Script demo
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  PSO-QAOA Demo — 6-site Kagome Pairing Circuit")
+    print("=" * 60)
+    result = run_pso_qaoa(n_sites=6, p_layers=1, backend="classical",
+                          delta_seed=0.3, n_particles=10, n_iter=20, seed=42)
+    gt, th = result["decoded_params"]
+    print(f"\nBest energy : {result['g_best_cost']:.6f}")
+    print(f"Converged   : {result['converged']}")
+    print(f"Gate types  : {[GATE_TYPES[g] for g in gt[:8]]}...")
+    print(f"Angles (rad): {[f'{t:.3f}' for t in th[:8]]}...")

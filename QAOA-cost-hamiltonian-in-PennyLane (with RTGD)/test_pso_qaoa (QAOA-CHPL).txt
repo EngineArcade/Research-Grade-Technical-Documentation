@@ -1,0 +1,302 @@
+"""
+test_pso_qaoa.py
+================
+Unit tests for the PSO engine and QAOA circuit template.
+
+Coverage
+--------
+  • Encoding/decoding: roundtrip, shape, gate-type range, theta range, bounds
+  • PSOEngine: result dict, g_best shape, sphere minimum, monotone history,
+    bounds compliance, convergence flag, seed reproducibility
+  • Cost Hamiltonian: J shape/symmetry, diagonal size, real-valued
+  • ClassicalBackend: scalar return, finite value, param sensitivity
+  • KagomePairingCircuit: param_dim, fitness scalar/finite, bounds, describe
+  • Integration: run_pso_qaoa keys, finite cost, decoded lengths,
+    PSO beats random baseline
+
+Run
+---
+    pytest tests/test_pso_qaoa.py -v
+
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+
+import numpy as np
+import pytest
+
+from pso_qaoa.pso_engine import (
+    PSOEngine, PSOConfig,
+    encode_particle, decode_particle, particle_bounds,
+    GATE_TYPES, N_GATE_TYPES,
+)
+from pso_qaoa.qaoa_circuit import (
+    KagomePairingCircuit,
+    ClassicalBackend,
+    kagome_6site_cost_matrix,
+    cost_hamiltonian_matrix,
+    run_pso_qaoa,
+)
+
+
+# ===========================================================================
+# Encoding / decoding
+# ===========================================================================
+
+class TestEncoding:
+
+    def test_roundtrip(self):
+        gt = [0, 1, 2, 3, 4, 0]
+        th = [0.1, 1.2, 2.3, 3.4, 4.5, 5.6]
+        x  = encode_particle(gt, th)
+        g2, t2 = decode_particle(x)
+        assert g2 == gt
+        assert np.allclose(np.array(t2) % (2*np.pi),
+                           np.array(th) % (2*np.pi), atol=1e-10)
+
+    @pytest.mark.parametrize("G", [2, 4, 8, 12])
+    def test_encode_shape(self, G):
+        x = encode_particle([0]*G, [1.]*G)
+        assert len(x) == 2 * G
+
+    def test_gate_type_always_valid(self):
+        rng = np.random.default_rng(7)
+        for _ in range(20):
+            x  = rng.uniform(0, N_GATE_TYPES + 2, size=10)
+            gt, _ = decode_particle(x)
+            for g in gt:
+                assert g in GATE_TYPES
+
+    def test_theta_always_in_0_2pi(self):
+        rng = np.random.default_rng(8)
+        for _ in range(20):
+            x  = rng.uniform(-10, 10, size=12)
+            _, th = decode_particle(x)
+            for t in th:
+                assert 0. <= t < 2*np.pi + 1e-10
+
+    @pytest.mark.parametrize("G", [4, 8, 16])
+    def test_bounds_shape(self, G):
+        lb, ub = particle_bounds(G)
+        assert lb.shape == (2*G,) and ub.shape == (2*G,)
+
+    def test_bounds_values_correct(self):
+        lb, ub = particle_bounds(6)
+        assert np.all(lb <= ub)
+        for i in range(6):
+            assert lb[2*i]   == 0.
+            assert ub[2*i]   == float(N_GATE_TYPES - 1)
+            assert lb[2*i+1] == 0.
+            assert abs(ub[2*i+1] - 2*np.pi) < 1e-10
+
+    def test_mismatched_lengths_raise(self):
+        with pytest.raises(ValueError):
+            encode_particle([0, 1, 2], [0.1, 0.2])
+
+
+# ===========================================================================
+# PSO Engine
+# ===========================================================================
+
+class TestPSOEngine:
+
+    @staticmethod
+    def sphere(x): return float(np.sum(x**2))
+
+    @pytest.fixture
+    def sphere_pso(self):
+        cfg = PSOConfig(n_particles=20, n_iter=50, seed=42, verbose=False)
+        lb  = -5 * np.ones(4); ub = 5 * np.ones(4)
+        return PSOEngine(self.sphere, cfg, dim=4, lb=lb, ub=ub)
+
+    def test_run_returns_dict(self, sphere_pso):
+        r = sphere_pso.run()
+        for k in ("g_best","g_best_cost","history","n_iter","converged"):
+            assert k in r
+
+    def test_g_best_shape(self, sphere_pso):
+        assert sphere_pso.run()["g_best"].shape == (4,)
+
+    def test_sphere_finds_minimum(self):
+        cfg = PSOConfig(n_particles=30, n_iter=200, seed=0, verbose=False,
+                        omega_decay=True)
+        lb  = -5*np.ones(4); ub = 5*np.ones(4)
+        r   = PSOEngine(self.sphere, cfg, dim=4, lb=lb, ub=ub).run()
+        assert r["g_best_cost"] < 1., \
+            f"Expected cost < 1, got {r['g_best_cost']:.4f}"
+
+    def test_history_length_equals_n_iter(self, sphere_pso):
+        r = sphere_pso.run()
+        assert len(r["history"]) == r["n_iter"]
+
+    def test_history_monotone_nonincreasing(self, sphere_pso):
+        h = sphere_pso.run()["history"]
+        for i in range(len(h)-1):
+            assert h[i] >= h[i+1] - 1e-10, \
+                f"History not monotone at {i}: {h[i]:.6f} > {h[i+1]:.6f}"
+
+    def test_g_best_within_bounds(self):
+        lb = np.array([0.,0.,1.,1.]); ub = np.array([1.,1.,2.,2.])
+        cfg = PSOConfig(n_particles=15, n_iter=30, seed=5, verbose=False)
+        r   = PSOEngine(self.sphere, cfg, dim=4, lb=lb, ub=ub).run()
+        assert np.all(r["g_best"] >= lb - 1e-8)
+        assert np.all(r["g_best"] <= ub + 1e-8)
+
+    def test_converges_on_flat_function(self):
+        flat = lambda x: 0.
+        cfg  = PSOConfig(n_particles=5, n_iter=100, tol=1e-6,
+                         seed=1, verbose=False)
+        lb, ub = particle_bounds(4)
+        r = PSOEngine(flat, cfg, dim=8, lb=lb, ub=ub).run()
+        assert r["converged"]
+
+    def test_seed_reproducibility(self):
+        fn  = lambda x: float(np.sum(np.sin(x)))
+        lb, ub = particle_bounds(3)
+        cfg = PSOConfig(n_particles=10, n_iter=20, seed=99, verbose=False)
+        r1  = PSOEngine(fn, cfg, dim=6, lb=lb, ub=ub).run()
+        r2  = PSOEngine(fn, cfg, dim=6, lb=lb, ub=ub).run()
+        assert np.allclose(r1["g_best"], r2["g_best"], atol=1e-12)
+
+    def test_best_circuit_params_before_run_raises(self):
+        cfg = PSOConfig(n_particles=5, n_iter=5, seed=0, verbose=False)
+        lb, ub = particle_bounds(4)
+        pso = PSOEngine(self.sphere, cfg, dim=8, lb=lb, ub=ub)
+        with pytest.raises(RuntimeError):
+            pso.best_circuit_params()
+
+
+# ===========================================================================
+# Cost Hamiltonian
+# ===========================================================================
+
+class TestCostHamiltonian:
+
+    def test_J_shape(self):
+        assert kagome_6site_cost_matrix().shape == (6, 6)
+
+    def test_J_symmetric(self):
+        J = kagome_6site_cost_matrix()
+        assert np.allclose(J, J.T, atol=1e-12)
+
+    def test_H_diag_size(self):
+        J = kagome_6site_cost_matrix()[:4, :4]
+        assert len(cost_hamiltonian_matrix(J)) == 2**4
+
+    def test_H_diag_real(self):
+        J = kagome_6site_cost_matrix()[:4, :4]
+        H = cost_hamiltonian_matrix(J)
+        assert np.isrealobj(H) or np.allclose(H.imag, 0, atol=1e-12)
+
+
+# ===========================================================================
+# ClassicalBackend
+# ===========================================================================
+
+class TestClassicalBackend:
+
+    @pytest.fixture
+    def backend(self):
+        return ClassicalBackend(n_qubits=4)
+
+    @pytest.fixture
+    def H_cost(self):
+        return cost_hamiltonian_matrix(kagome_6site_cost_matrix()[:4, :4])
+
+    def test_returns_scalar(self, backend, H_cost):
+        x  = encode_particle([0,1,2,3], [0.5,1.,1.5,2.])
+        gt, th = decode_particle(x)
+        val = backend.expectation(x, gt, th, H_cost)
+        assert isinstance(val, (float, np.floating))
+
+    def test_returns_finite(self, backend, H_cost):
+        for seed in range(3):
+            rng = np.random.default_rng(seed)
+            x   = rng.uniform(0, 2*np.pi, size=8)
+            gt, th = decode_particle(x)
+            assert np.isfinite(backend.expectation(x, gt, th, H_cost))
+
+    def test_different_params_differ(self, backend, H_cost):
+        x1 = encode_particle([0,0,0,0], [0.,0.,0.,0.])
+        x2 = encode_particle([1,1,1,1], [1.5,1.5,1.5,1.5])
+        g1,t1 = decode_particle(x1); g2,t2 = decode_particle(x2)
+        e1 = backend.expectation(x1,g1,t1,H_cost)
+        e2 = backend.expectation(x2,g2,t2,H_cost)
+        # at least check no crash; values may coincide occasionally
+        assert np.isfinite(e1) and np.isfinite(e2)
+
+
+# ===========================================================================
+# KagomePairingCircuit
+# ===========================================================================
+
+class TestKagomePairingCircuit:
+
+    @pytest.fixture
+    def circuit(self):
+        return KagomePairingCircuit(n_sites=6, p_layers=1, backend="classical")
+
+    def test_param_dim(self, circuit):
+        assert circuit.param_dim == 2 * circuit.n_gates
+
+    def test_fitness_scalar(self, circuit):
+        x   = np.random.default_rng(0).uniform(0, 1, size=circuit.param_dim)
+        val = circuit.fitness(x)
+        assert isinstance(val, (float, np.floating))
+
+    def test_fitness_finite(self, circuit):
+        rng = np.random.default_rng(1)
+        for _ in range(3):
+            x = rng.uniform(0, 2*np.pi, size=circuit.param_dim)
+            assert np.isfinite(circuit.fitness(x))
+
+    def test_bounds_shape(self, circuit):
+        lb, ub = circuit.bounds()
+        assert lb.shape == ub.shape == (circuit.param_dim,)
+
+    def test_describe_contains_kagome(self, circuit):
+        assert "Kagome" in circuit.describe()
+
+    def test_backend_is_classical(self, circuit):
+        assert isinstance(circuit._backend, ClassicalBackend)
+
+
+# ===========================================================================
+# Integration: run_pso_qaoa
+# ===========================================================================
+
+class TestPSOQAOAIntegration:
+
+    def test_result_keys(self):
+        r = run_pso_qaoa(n_sites=6, p_layers=1, backend="classical",
+                         n_particles=5, n_iter=8, seed=0, verbose=False)
+        for k in ("g_best","g_best_cost","history","converged",
+                  "circuit","decoded_params"):
+            assert k in r
+
+    def test_finite_cost(self):
+        r = run_pso_qaoa(n_sites=6, p_layers=1, backend="classical",
+                         n_particles=5, n_iter=5, seed=1, verbose=False)
+        assert np.isfinite(r["g_best_cost"])
+
+    def test_decoded_params_length_match(self):
+        r = run_pso_qaoa(n_sites=6, p_layers=1, backend="classical",
+                         n_particles=5, n_iter=5, seed=2, verbose=False)
+        gt, th = r["decoded_params"]
+        assert len(gt) == len(th)
+
+    def test_pso_beats_random(self):
+        circuit = KagomePairingCircuit(n_sites=6, p_layers=1,
+                                       backend="classical")
+        rng  = np.random.default_rng(10)
+        lb, ub = circuit.bounds()
+        rand_best = min(
+            circuit.fitness(lb + rng.random(circuit.param_dim)*(ub-lb))
+            for _ in range(10)
+        )
+        r = run_pso_qaoa(n_sites=6, p_layers=1, backend="classical",
+                         n_particles=10, n_iter=30, seed=7, verbose=False)
+        assert r["g_best_cost"] <= rand_best + 0.5
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

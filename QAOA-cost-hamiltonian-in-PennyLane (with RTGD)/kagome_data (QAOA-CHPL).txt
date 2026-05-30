@@ -1,0 +1,166 @@
+"""
+kagome_data.py
+==============
+Kagome lattice geometry and example tight-binding parameters.
+
+Lattice:
+    a1 = (1, 0),  a2 = (0.5, sqrt(3)/2)
+Basis (Cartesian):
+    A = (0, 0),  B = (0.5, 0),  C = (0.25, sqrt(3)/4)
+
+Default parameters:
+    t   = -1.0 eV   nearest-neighbour hopping
+    t2  =  0.0 eV   next-nearest hopping
+    mu  = -1.0 eV   chemical potential
+    Delta = 0.3 eV  s-wave pairing amplitude
+
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+
+import numpy as np
+
+SQRT3 = np.sqrt(3.0)
+
+# Primitive vectors
+A1 = np.array([1.0, 0.0])
+A2 = np.array([0.5, SQRT3 / 2.0])
+
+# Basis positions (Cartesian)
+BASIS = {
+    "A": np.array([0.0, 0.0]),
+    "B": np.array([0.5, 0.0]),
+    "C": np.array([0.25, SQRT3 / 4.0]),
+}
+
+DEFAULT_PARAMS = {
+    "t":     -1.0,
+    "t2":     0.0,
+    "mu":    -1.0,
+    "Delta":  0.3,
+}
+
+
+# ---------------------------------------------------------------------------
+# Bulk Bloch Hamiltonian  H(k)  — 3×3 complex
+# ---------------------------------------------------------------------------
+
+def kagome_bulk_hamiltonian(kx: float, ky: float,
+                             t: float = -1.0,
+                             mu: float = 0.0,
+                             t2: float = 0.0) -> np.ndarray:
+    """
+    3×3 bulk Bloch Hamiltonian for the Kagome lattice at (kx, ky).
+
+    Parameters
+    ----------
+    kx, ky : float   Crystal momentum (units of 1/a).
+    t      : float   Nearest-neighbour hopping.
+    mu     : float   On-site chemical potential.
+    t2     : float   Next-nearest hopping (real, simplified).
+
+    Returns
+    -------
+    H : ndarray (3, 3), complex — Hermitian Bloch Hamiltonian.
+    """
+    f1 = np.exp(1j * kx / 2.0)
+    f2 = np.exp(1j * (kx / 4.0 + ky * SQRT3 / 4.0))
+    f3 = np.exp(1j * (-kx / 4.0 + ky * SQRT3 / 4.0))
+
+    H = np.zeros((3, 3), dtype=complex)
+    H[0, 1] = t * (f1 + np.conj(f1))
+    H[1, 2] = t * (f2 + np.conj(f2))
+    H[0, 2] = t * (f3 + np.conj(f3))
+    H += H.conj().T - np.diag(np.diag(H))   # symmetrise off-diagonal
+    H -= mu * np.eye(3)
+
+    if t2 != 0.0:
+        H += t2 * np.eye(3)   # simplified NNN
+
+    return H
+
+
+# ---------------------------------------------------------------------------
+# Finite Kagome strip  — (3 * N_cells) × (3 * N_cells)
+# ---------------------------------------------------------------------------
+
+def build_kagome_strip(N_cells: int = 6,
+                       t: float = -1.0,
+                       mu: float = -1.0,
+                       t2: float = 0.0) -> np.ndarray:
+    """
+    Real-space tight-binding Hamiltonian for a finite Kagome strip.
+
+    Sites ordered: [A0, B0, C0, A1, B1, C1, ..., A_{N-1}, B_{N-1}, C_{N-1}]
+    Open boundary conditions along x.
+
+    Parameters
+    ----------
+    N_cells : int   Number of unit cells.
+    t       : float Nearest-neighbour hopping.
+    mu      : float Chemical potential.
+    t2      : float Next-nearest hopping.
+
+    Returns
+    -------
+    H_TB : ndarray (3*N_cells, 3*N_cells), complex
+    """
+    n = 3 * N_cells
+    H = np.zeros((n, n), dtype=complex)
+
+    for cell in range(N_cells):
+        base = 3 * cell
+
+        # Intra-cell hoppings
+        H[base,   base+1] += t
+        H[base+1, base+2] += t
+        H[base,   base+2] += t
+
+        # Inter-cell hoppings
+        if cell + 1 < N_cells:
+            nb = 3 * (cell + 1)
+            H[base+1, nb]   += t
+            H[base+2, nb+1] += t
+            H[base,   nb+2] += t
+            if t2 != 0.0:
+                for s in range(3):
+                    H[base+s, nb+s] += t2
+
+        # On-site (chemical potential)
+        H[base,   base]   -= mu
+        H[base+1, base+1] -= mu
+        H[base+2, base+2] -= mu
+
+    # Enforce Hermiticity: keep diagonal, symmetrise off-diagonal
+    for i in range(n):
+        for j in range(i + 1, n):
+            val = (H[i, j] + np.conj(H[j, i])) / 2.0
+            H[i, j] = val
+            H[j, i] = np.conj(val)
+
+    return H
+
+
+# ---------------------------------------------------------------------------
+# Convenience loader
+# ---------------------------------------------------------------------------
+
+def get_example_kagome_strip_params(N_cells: int = 6) -> dict:
+    """
+    Return example Kagome strip data ready for BdG construction.
+
+    Returns
+    -------
+    dict with keys:
+        'H_TB'    ndarray (3*N_cells, 3*N_cells) — tight-binding Hamiltonian
+        'Delta'   float   — s-wave pairing amplitude
+        'N_sites' int     — total lattice sites
+        'params'  dict    — TB parameters used
+    """
+    p = DEFAULT_PARAMS.copy()
+    H_TB = build_kagome_strip(N_cells, t=p["t"], mu=p["mu"], t2=p["t2"])
+    return {
+        "H_TB":    H_TB,
+        "Delta":   p["Delta"],
+        "N_sites": 3 * N_cells,
+        "params":  p,
+    }

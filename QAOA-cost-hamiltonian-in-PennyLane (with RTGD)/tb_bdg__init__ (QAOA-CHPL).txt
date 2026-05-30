@@ -1,0 +1,14 @@
+"""
+tb_bdg — Tight-Binding to Bogoliubov-de Gennes solver package.
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+from .bdg_solver import BdGSolver, pfaffian, build_pairing_matrix, load_wannier_hr
+from .kagome_data import (
+    kagome_bulk_hamiltonian,
+    build_kagome_strip,
+    get_example_kagome_strip_params,
+)
+__all__ = [
+    "BdGSolver", "pfaffian", "build_pairing_matrix", "load_wannier_hr",
+    "kagome_bulk_hamiltonian", "build_kagome_strip", "get_example_kagome_strip_params",
+]

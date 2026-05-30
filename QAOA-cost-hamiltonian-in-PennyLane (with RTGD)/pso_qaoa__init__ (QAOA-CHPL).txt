@@ -1,0 +1,28 @@
+"""
+pso_qaoa — PSO-seeded QAOA circuit optimisation package.
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+from .pso_engine import (
+    PSOEngine, PSOConfig,
+    encode_particle, decode_particle, particle_bounds,
+    GATE_TYPES, N_GATE_TYPES,
+)
+from .qaoa_circuit import (
+    KagomePairingCircuit,
+    ClassicalBackend,
+    QiskitBackend,
+    PennyLaneBackend,
+    kagome_6site_cost_matrix,
+    cost_hamiltonian_matrix,
+    run_pso_qaoa,
+)
+
+__all__ = [
+    "PSOEngine", "PSOConfig",
+    "encode_particle", "decode_particle", "particle_bounds",
+    "GATE_TYPES", "N_GATE_TYPES",
+    "KagomePairingCircuit",
+    "ClassicalBackend", "QiskitBackend", "PennyLaneBackend",
+    "kagome_6site_cost_matrix", "cost_hamiltonian_matrix",
+    "run_pso_qaoa",
+]

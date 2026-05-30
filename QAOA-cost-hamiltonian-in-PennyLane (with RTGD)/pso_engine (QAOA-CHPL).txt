@@ -1,0 +1,336 @@
+"""
+pso_engine.py
+=============
+Particle Swarm Optimisation (PSO) engine for seeding QAOA / VQC circuits.
+
+Particle encoding
+-----------------
+Each PSO particle is a flat vector:
+    x = [g0, theta0, g1, theta1, ..., g_{G-1}, theta_{G-1}]
+
+    g_i     ∈ {0=RX, 1=RY, 2=RZ, 3=CX, 4=CZ}   discrete gate type
+    theta_i ∈ [0, 2*pi]                           continuous rotation angle
+
+PSO update rule (standard inertia-weight form)
+-----------------------------------------------
+    v_{t+1} = omega * v_t
+              + c1 * r1 * (p_best - x_t)
+              + c2 * r2 * (g_best - x_t)
+    x_{t+1} = x_t + v_{t+1}
+
+Velocity is clamped to v_max = v_max_frac * (ub - lb).
+Boundary violations are handled with a reflecting scheme.
+
+Recommended hyperparameters (Clerc-Kennedy constriction)
+---------------------------------------------------------
+    omega = 0.7298,  c1 = c2 = 1.49618,  N = 30
+
+Pipeline position
+-----------------
+    BdG spectrum  →  [YOU ARE HERE: PSO]  ⇄  QAOA VQC  →  Validation
+
+MIT License — Copyright (c) 2026 Robert Quinn
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+GATE_TYPES    = {0: "RX", 1: "RY", 2: "RZ", 3: "CX", 4: "CZ"}
+N_GATE_TYPES  = len(GATE_TYPES)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PSOConfig:
+    """
+    PSO hyperparameter configuration.
+
+    Attributes
+    ----------
+    n_particles : int    Swarm size. Typical: 20–50.
+    n_iter      : int    Maximum iterations.
+    omega       : float  Inertia weight ∈ (0, 1). Classic: 0.7298.
+    c1          : float  Cognitive coefficient (personal best). Typical: 1.49618.
+    c2          : float  Social coefficient (global best).    Typical: 1.49618.
+    v_max_frac  : float  Max velocity as fraction of search range. Typical: 0.20.
+    omega_decay : bool   Linearly decay omega from omega_max → omega_min.
+    omega_max   : float  Start inertia (when omega_decay=True). Default: 0.90.
+    omega_min   : float  End   inertia (when omega_decay=True). Default: 0.40.
+    tol         : float  Early-stop tolerance on g_best_cost change.
+    seed        : int    RNG seed for reproducibility.
+    verbose     : bool   Print progress every 10 iterations.
+    """
+    n_particles: int            = 30
+    n_iter:      int            = 100
+    omega:       float          = 0.7298
+    c1:          float          = 1.49618
+    c2:          float          = 1.49618
+    v_max_frac:  float          = 0.20
+    omega_decay: bool           = True
+    omega_max:   float          = 0.90
+    omega_min:   float          = 0.40
+    tol:         float          = 1e-6
+    seed:        Optional[int]  = 42
+    verbose:     bool           = True
+
+
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+def encode_particle(gate_types: List[int], thetas: List[float]) -> np.ndarray:
+    """
+    Pack (gate_types, thetas) into a flat PSO particle vector.
+
+    Layout: [g0, theta0, g1, theta1, ..., g_{G-1}, theta_{G-1}]
+
+    Parameters
+    ----------
+    gate_types : list of int  Gate indices (0–4).
+    thetas     : list of float Rotation angles [rad].
+
+    Returns
+    -------
+    x : ndarray (2*G,)
+    """
+    G = len(gate_types)
+    if len(thetas) != G:
+        raise ValueError("gate_types and thetas must have equal length.")
+    x = np.empty(2 * G, dtype=float)
+    for i, (g, th) in enumerate(zip(gate_types, thetas)):
+        x[2 * i]     = float(g)
+        x[2 * i + 1] = float(th)
+    return x
+
+
+def decode_particle(x: np.ndarray) -> Tuple[List[int], List[float]]:
+    """
+    Unpack a flat PSO particle vector into (gate_types, thetas).
+
+    gate types are rounded to nearest int mod N_GATE_TYPES.
+    thetas are wrapped to [0, 2*pi).
+
+    Parameters
+    ----------
+    x : ndarray (2*G,)
+
+    Returns
+    -------
+    gate_types : list of int
+    thetas     : list of float in [0, 2*pi)
+    """
+    G          = len(x) // 2
+    gate_types = [int(np.round(x[2 * i])) % N_GATE_TYPES  for i in range(G)]
+    thetas     = [float(x[2 * i + 1])     % (2 * np.pi)   for i in range(G)]
+    return gate_types, thetas
+
+
+def particle_bounds(n_gates: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return lower and upper bounds for a particle with n_gates gates.
+
+    gate type: [0, N_GATE_TYPES - 1]   (= [0, 4])
+    theta:     [0, 2*pi]
+
+    Returns
+    -------
+    lb, ub : ndarray (2*n_gates,)
+    """
+    lb = np.zeros(2 * n_gates)
+    ub = np.zeros(2 * n_gates)
+    for i in range(n_gates):
+        lb[2 * i]     = 0.0
+        ub[2 * i]     = float(N_GATE_TYPES - 1)
+        lb[2 * i + 1] = 0.0
+        ub[2 * i + 1] = 2.0 * np.pi
+    return lb, ub
+
+
+# ---------------------------------------------------------------------------
+# PSO Engine
+# ---------------------------------------------------------------------------
+
+class PSOEngine:
+    """
+    Standard inertia-weight Particle Swarm Optimiser.
+
+    Parameters
+    ----------
+    fitness_fn : callable
+        fitness_fn(x: ndarray) -> float.  Lower is better (minimisation).
+        Hook this to your QAOA / BdG cost function.
+    config     : PSOConfig
+    dim        : int   Dimensionality of search space (= 2 * n_gates).
+    lb, ub     : ndarray (dim,)  Bounds.  Defaults from particle_bounds().
+
+    Attributes (after run())
+    ------------------------
+    g_best      : ndarray (dim,)  Global best particle.
+    g_best_cost : float           Cost at g_best.
+    history     : list of float   g_best_cost per iteration.
+    """
+
+    def __init__(self,
+                 fitness_fn: Callable[[np.ndarray], float],
+                 config: PSOConfig,
+                 dim: int,
+                 lb: Optional[np.ndarray] = None,
+                 ub: Optional[np.ndarray] = None):
+        self.fitness_fn = fitness_fn
+        self.cfg        = config
+        self.dim        = dim
+        n_gates         = dim // 2
+        d_lb, d_ub      = particle_bounds(n_gates)
+        self.lb         = d_lb if lb is None else np.array(lb, dtype=float)
+        self.ub         = d_ub if ub is None else np.array(ub, dtype=float)
+        if self.lb.shape != (dim,) or self.ub.shape != (dim,):
+            raise ValueError(f"Bounds must have shape ({dim},).")
+        self.rng        = np.random.default_rng(config.seed)
+        self.g_best:      Optional[np.ndarray] = None
+        self.g_best_cost: float                = np.inf
+        self.history:     List[float]          = []
+        self._positions:  Optional[np.ndarray] = None
+        self._velocities: Optional[np.ndarray] = None
+        self._p_best:     Optional[np.ndarray] = None
+        self._p_cost:     Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    def _initialise(self) -> None:
+        n = self.cfg.n_particles
+        lb, ub = self.lb, self.ub
+        self._positions  = lb + self.rng.random((n, self.dim)) * (ub - lb)
+        v_max            = self.cfg.v_max_frac * (ub - lb)
+        self._velocities = -v_max + self.rng.random((n, self.dim)) * 2 * v_max
+        costs            = np.array([self.fitness_fn(self._positions[i])
+                                     for i in range(n)])
+        self._p_best = self._positions.copy()
+        self._p_cost = costs.copy()
+        best = np.argmin(costs)
+        self.g_best      = self._positions[best].copy()
+        self.g_best_cost = float(costs[best])
+
+    # ------------------------------------------------------------------
+    def _step(self, iteration: int) -> None:
+        cfg = self.cfg
+        n   = cfg.n_particles
+        omega = (cfg.omega_max
+                 - (cfg.omega_max - cfg.omega_min) * iteration / max(cfg.n_iter - 1, 1)
+                 if cfg.omega_decay else cfg.omega)
+
+        r1 = self.rng.random((n, self.dim))
+        r2 = self.rng.random((n, self.dim))
+
+        # Velocity update
+        self._velocities = (omega * self._velocities
+                            + cfg.c1 * r1 * (self._p_best  - self._positions)
+                            + cfg.c2 * r2 * (self.g_best   - self._positions))
+
+        # Clamp velocity
+        v_max = cfg.v_max_frac * (self.ub - self.lb)
+        self._velocities = np.clip(self._velocities, -v_max, v_max)
+
+        # Position update
+        self._positions += self._velocities
+
+        # Reflecting boundary
+        for d in range(self.dim):
+            lo, hi = self.lb[d], self.ub[d]
+            ml = self._positions[:, d] < lo
+            mh = self._positions[:, d] > hi
+            self._positions[ml, d]   = lo + (lo - self._positions[ml, d])
+            self._velocities[ml, d] *= -1
+            self._positions[mh, d]   = hi - (self._positions[mh, d] - hi)
+            self._velocities[mh, d] *= -1
+            self._positions[:, d]    = np.clip(self._positions[:, d], lo, hi)
+
+        # Fitness evaluation
+        costs = np.array([self.fitness_fn(self._positions[i]) for i in range(n)])
+
+        # Personal best update
+        imp = costs < self._p_cost
+        self._p_best[imp] = self._positions[imp].copy()
+        self._p_cost[imp] = costs[imp]
+
+        # Global best update
+        best = np.argmin(self._p_cost)
+        if self._p_cost[best] < self.g_best_cost:
+            self.g_best      = self._p_best[best].copy()
+            self.g_best_cost = float(self._p_cost[best])
+
+    # ------------------------------------------------------------------
+    def run(self) -> dict:
+        """
+        Execute the full PSO optimisation loop.
+
+        Returns
+        -------
+        dict with keys:
+            'g_best'      ndarray  — best parameter vector found
+            'g_best_cost' float    — minimum cost achieved
+            'history'     list     — g_best_cost per iteration
+            'n_iter'      int      — iterations completed
+            'converged'   bool     — True if tol criterion met early
+        """
+        self._initialise()
+        prev      = np.inf
+        converged = False
+
+        for it in range(self.cfg.n_iter):
+            self._step(it)
+            self.history.append(self.g_best_cost)
+            if self.cfg.verbose and (it % 10 == 0 or it == self.cfg.n_iter - 1):
+                print(f"  PSO {it+1:4d}/{self.cfg.n_iter} "
+                      f"| g_best_cost = {self.g_best_cost:.8f}")
+            if abs(prev - self.g_best_cost) < self.cfg.tol:
+                if self.cfg.verbose:
+                    print(f"  Converged at iteration {it+1} "
+                          f"(delta < {self.cfg.tol})")
+                converged = True
+                break
+            prev = self.g_best_cost
+
+        return {
+            "g_best":      self.g_best,
+            "g_best_cost": self.g_best_cost,
+            "history":     self.history,
+            "n_iter":      len(self.history),
+            "converged":   converged,
+        }
+
+    # ------------------------------------------------------------------
+    def best_circuit_params(self) -> Tuple[List[int], List[float]]:
+        """Decode g_best into (gate_types, thetas). Requires run() first."""
+        if self.g_best is None:
+            raise RuntimeError("PSO has not been run. Call .run() first.")
+        return decode_particle(self.g_best)
+
+    # ------------------------------------------------------------------
+    def convergence_plot(self, save_path: Optional[str] = None) -> None:
+        """Plot the g_best_cost convergence curve (requires matplotlib)."""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            warnings.warn("matplotlib not installed; skipping plot.")
+            return
+        plt.figure(figsize=(8, 4))
+        plt.plot(self.history, "b-o", ms=3, lw=1.5)
+        plt.xlabel("Iteration"); plt.ylabel("Global best cost")
+        plt.title("PSO Convergence"); plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+        else:
+            plt.show()

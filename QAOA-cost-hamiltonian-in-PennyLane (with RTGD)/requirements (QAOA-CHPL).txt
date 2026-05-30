@@ -1,0 +1,33 @@
+# PSO-QAOA Topological Superconductor Pipeline
+# Core requirements — Python >= 3.10
+# Install: pip install -r requirements.txt
+
+# ── Numerics (always required) ─────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+h5py>=3.8
+
+# ── Tight-binding / BdG (optional but recommended) ────────────────────────
+# pfapack: Pfaffian computation for Z2 invariant
+#   pip install pfapack
+# kwant: network-model geometry builder
+#   pip install kwant
+# pythtb: tight-binding models
+#   pip install pythtb
+
+# ── Quantum backends (choose one or both) ─────────────────────────────────
+qiskit>=1.0
+qiskit-aer>=0.13
+pennylane>=0.38
+
+# ── Testing ────────────────────────────────────────────────────────────────
+pytest>=7.0
+pytest-cov>=4.0
+
+# ── Optional: algebra / symbolic ──────────────────────────────────────────
+sympy>=1.12
+
+# ── Optional: tensor networks ─────────────────────────────────────────────
+# tenpy>=0.10    # TeNPy MPS/DMRG
+# itensor        # ITensor (Julia, not pip)
